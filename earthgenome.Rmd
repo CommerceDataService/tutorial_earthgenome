@@ -1,0 +1,171 @@
+---
+title: "Building Operational Science on Open Data"
+output: html_document
+---
+
+
+In this installment, we provide an R Notebook to open and visualize NOAA’s digital elevation model (DEM) data. DEM data plays an important role across fields, used for:
+
+- Hydrological modeling as topography controls the flow of water 
+- Estimating landslide risk as the slope has an effect on earth movement
+- Placement of antennae for telecommunications
+- Construction planning for buildings, roads, railways, and energy infrastructure
+
+To get started with DEM data, this tutorial illustrates how to create a browser-ready 3D interactive map of the US' terrain. Note that NOAA has a number of DEM datasets and GLOBE is a vintage, but is still relied upon for research and application. For information on additional DEMs such as ETOPO1 Global relief, please visit the [NOAA topographic data page](http://www.ngdc.noaa.gov/mgg/topo/topo.html).
+
+Part 1: Preliminaries
+Let's first clear your R environment and call the following libraries:
+
+- **raster**. Raster data manipulation library.
+- **plotly**. Simple visualization library including a 3D surface plotter
+
+```{r message=FALSE, warning=FALSE}
+## Clear environment
+  rm(list = ls())
+
+##Call in libraries
+  library(raster)
+  library(plotly)
+```
+
+Part 2: Drawing down data
+Before downloading the data, here's a quick crash course about NOAA GLOBE data. First, the file is stored in a .BIN (binary) format with HDR (header) metadata file that is maintained separately. The HDR file contains basic spatial extents and dimensions of the BIN file, which dictate how any program will read in the binary as a raster. Second, there's quite a bit of data, so scientists have cut up the DEM into 16 tiles. As seen below, the lower 48 states + Hawaii are contained in tiles "E" and "F".
+
+[Image of the site here]
+
+To streamline our workflow, we'll write two functions: (1) one to download and read the HDR attributes, (2) one to download the BIN file and read in as a raster using the HDR attributes. As the files are not prohibitively large, we'll perform the ingest and processing in-memory. 
+
+Part 2.1: HDR Download
+Nice and simply, we've written a function to download the HDR code and read it into a table as tab-separated values. The function accepts a character representing the tile index (e.g "e", "a"), creates a URL with the tile index, then reads the HDR file as a table. A cursory look at the output of the basic function shows that each row contains parameters that dictate the dimensions and spatial extent of the BIN file. 
+
+```{r message=FALSE, warning=FALSE}
+
+header <- function(tile_letter) {
+  url <- paste("http://www.ngdc.noaa.gov/mgg/topo/data/source/esri/hdr/",tolower(tile_letter),"10s.hdr",sep="")
+  temp = tempfile()
+  download.file(url, temp, method="libcurl") ##download the URL taret to the temp file
+  return(read.table(temp, quote="\"", stringsAsFactors=FALSE))
+}
+
+#Run function
+header("e")
+
+```
+
+Part 2.2: BIN Download
+Reading in the DEM file involves a slight bit more effort. The function accepts the tile index and the header function produced hdr file. Using those arguments, five steps are taken:
+
+- Download the DEM tile
+- Extract spatial dimensions of the raster from the HDR file
+- Create a blank raster
+- Read in the DEM's binary values
+- Set the binary values to the blank raster
+
+```{r message=FALSE, warning=FALSE}
+
+dem_tile <- function(tile_letter,hdr_file) {
+  
+  #Load in raster package
+    require(raster)
+  
+  #Download
+    letter <- tolower(tile_letter)
+    url <- paste("http://www.ngdc.noaa.gov/mgg/topo/DATATILES/elev/",letter,"10g.zip",sep="")
+    temp = tempfile()
+    download.file(url, temp, method="libcurl") ##download the URL target to the temp file
+    unzip(temp,exdir=getwd()) ##unzip that file
+  
+  #Define raster file dimensions and extent from HDR file
+    hdr_file[,2] <-as.numeric(hdr_file[,2])
+    col= hdr_file[4,2]
+    row = hdr_file[3,2]
+    mat= col*row
+    xmin = hdr_file[11,2]
+    xmax = xmin + hdr_file[13,2]*col
+    ymin = hdr_file[12,2]
+    ymax = ymin + hdr_file[14,2]*row
+    
+  #Create a blank raster with certain dimensions
+    bil <- raster(ncols=col, nrows= row, xmn=xmin, xmx=xmax, ymn=ymin, ymx=ymax )
+  
+  #Read in BIN file
+    bin <- readBin(paste(letter,"10g",sep=""), what="integer", n=mat,endian="little", signed=TRUE, size=2)
+  
+  #Return a file tht sets BIN values into the blank raster file
+    return(setValues(bil, bin))
+}
+
+```
+
+How does this work when we put it together? Well, let's take tile "E" for the US West Coast/Pacific. We'll plot the result of the dem_file. Note that Rockies are clearly colored at the right of the map? This is just the beginning.
+
+```{r, message=FALSE, warning=FALSE}
+ 
+#Read in Tile "E"
+  hdr <- header("e")
+  dem_result <- dem_tile("e",hdr)
+
+#Plot Tile "E"
+  plot(dem_result)
+  
+```
+
+Part 3: Processing for Maps
+Now that we have this basic set of functions to bring in the data, we can easily pull together and merge tiles "E" and "F" and map the merged raster.
+
+```{r, message=FALSE, warning=FALSE}
+  
+#Read in the tiles
+  letters <- c("e","f")
+  
+  for(k in letters){
+    hdr <- header(k)
+    dem_result <- dem_tile(k, hdr)
+    assign(paste("dem_",k,sep=""),dem_result)
+    rm(dem_result)
+    print(paste(k," - Done"))
+  }
+
+#Merge east coast and west coast
+  region <- merge(dem_e, dem_f)
+  dim(region)
+  
+#Map it!
+  plot(region)
+
+```
+
+Note that the raster dimension is about 129.6 million cells (6000 x 21600). That may be quite a bit more than what an interactive 3D model can handle. To process it down, we'll convert the raster into sparse matrix format, averaging every 25 cells -- or just 200,000+ cells at 25-km resolution as opposed to the original 1-km resolution. In matrix form, the DEM will be backwards along the X-axis, which means we will need to flip the order of columns. 
+
+In is important to note that the different applications of DEMs require different raster resolution. NOAA's DEMs are useful at a macro scale, looking at environmental and regional issues. For small area topography, it is often useful to check for LiDAR-based data for high precision, high resolution topography.
+
+```{r, message=FALSE, warning=FALSE}
+  #Average every 25 rasters cells
+    a <- aggregate(region, fact=25, fun=mean)
+    a <- as.matrix(a)
+    a[a < 0]<-NA
+
+  #Flip order of columns  
+    a<-a[,seq(dim(a)[2],1,-1)]
+    dim(a)
+```
+
+Now the data is in the right form, we can use a convenient plotly package to create a 3D rendering of the US. Of course, topography is a major determinant of how the Brazos River flows, but other datasets that contain groundtruthed water flow (e.g. USGS National Water Information Service) and vegetation data (e.g. NDVI from NASA and NOAA satellites) play large roles in the creation of environmental data services.
+
+```{r, message=FALSE, warning=FALSE}
+
+  #Parameter for view of 3d surface
+    scene = list(
+      #set where the camera will point from
+        camera = list( eye = list(x = 0, y = 1, z = 1)),
+      #set the canvas space proportions
+        aspectratio =  list(x = 2, y = 1, z = 0.2) 
+        )
+    
+  #Plot map
+      plot_ly(z = a, type = "surface", colors = terrain.colors(10)) %>% 
+        layout(scene=scene)
+
+
+```
+
